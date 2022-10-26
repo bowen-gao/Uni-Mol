@@ -4,6 +4,7 @@
 
 import logging
 import os
+import torch
 
 import numpy as np
 from unicore.data import (
@@ -284,3 +285,35 @@ class UniMolFinetuneTask(UnicoreTask):
             num_classes=self.args.num_classes,
         )
         return model
+    def train_step(
+        self, sample, model, loss, optimizer, update_num, ignore_grad=False
+    ):
+        """
+        Do forward and backward, and return the loss as computed by *loss*
+        for the given *model* and *sample*.
+
+        Args:
+            sample (dict): the mini-batch. The format is defined by the
+                :class:`~unicore.data.UnicoreDataset`.
+            model (~unicore.models.BaseUnicoreModel): the model
+            loss (~unicore.losses.UnicoreLoss): the loss
+            optimizer (~unicore.optim.UnicoreOptimizer): the optimizer
+            update_num (int): the current update
+            ignore_grad (bool): multiply loss by 0 if this is set to True
+
+        Returns:
+            tuple:
+                - the loss
+                - the sample size, which is used as the denominator for the
+                  gradient
+                - logging outputs to display while training
+        """
+        model.train()
+        model.set_num_updates(update_num)
+        with torch.autograd.profiler.record_function("forward"):
+            loss, sample_size, logging_output = loss(model, sample)
+        if ignore_grad:
+            loss *= 0
+        with torch.autograd.profiler.record_function("backward"):
+            optimizer.backward(loss)
+        return loss, sample_size, logging_output

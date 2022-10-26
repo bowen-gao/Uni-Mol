@@ -92,13 +92,20 @@ def main(args):
             default_log_format=("tqdm" if not args.no_progress_bar else "simple"),
         )
         log_outputs = []
+        acc_loss = 0.0
+        acc_sample = 0.0
         for i, sample in enumerate(progress):
             sample = utils.move_to_cuda(sample) if use_cuda else sample
             if len(sample) == 0:
                 continue
-            _, _, log_output = task.valid_step(sample, model, loss, test=True)
+            l, sample_size, log_output = task.valid_step(sample, model, loss, test=True)
+            # print(i, sample_size, l)
+            acc_loss += l
+            acc_sample += sample_size
             progress.log({}, step=i)
             log_outputs.append(log_output)
+        acc_loss = acc_loss/acc_sample
+        print(acc_loss)
         pickle.dump(log_outputs, open(save_path, "wb"))
         logger.info("Done inference! ")
     return None

@@ -1,5 +1,6 @@
 data_path="/data/data/molecule/molecular_property_prediction/"  # replace to your data path
 save_dir="/data/models/unimol/save/1026/"  # replace to your save path
+tsb_dir="./tsb"
 n_gpu=4
 MASTER_PORT=10086
 dict_name="dict.txt"
@@ -42,7 +43,8 @@ python -m torch.distributed.launch --nproc_per_node=$n_gpu --master_port=$MASTER
        --validate-interval 1 \
        --finetune-from-model $weight_path \
        --best-checkpoint-metric $metric --patience 20 \
-       --save-dir $save_dir --only-polar $only_polar \
+       --save-dir $save_dir --tensorboard-logdir $tsb_dir \
+       --only-polar $only_polar \
        --reg
 
 # --reg, for regression task
