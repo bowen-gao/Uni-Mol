@@ -190,6 +190,7 @@ class UniMolModel(BaseUnicoreModel):
         encoder_masked_tokens=None,
         features_only=False,
         classification_head_name=None,
+        encode_mode=False,
         **kwargs
     ):
 
@@ -244,7 +245,7 @@ class UniMolModel(BaseUnicoreModel):
 
         if classification_head_name is not None:
             logits = self.classification_heads[classification_head_name](encoder_rep)
-        if self.args.mode == 'infer':
+        if self.args.mode == 'infer' or encode_mode==True:
             return encoder_rep, encoder_pair_rep
         else:
             return (

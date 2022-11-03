@@ -59,6 +59,7 @@ class FinetuneCrossEntropyLoss(CrossEntropyLoss):
         lprobs = F.log_softmax(net_output.float(), dim=-1)
         lprobs = lprobs.view(-1, lprobs.size(-1))
         targets = sample["target"]["finetune_target"].view(-1)
+        # print("111", lprobs.shape, targets.shape, sample["target"]["finetune_target"].shape)
         loss = F.nll_loss(
             lprobs,
             targets,
