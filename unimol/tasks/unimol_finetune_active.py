@@ -211,15 +211,27 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         )
         parser.add_argument(
             "--adv-lambda",
-            default=0.1,
+            default=0.5,
             type=float,
             help="step size for adv attack",
         )
         parser.add_argument(
             "--random-gaussian",
-            default=True,
+            default=False,
             type=Boolean,
             help="whether use gaussian noise instead of adv attack",
+        )
+        parser.add_argument(
+            "--random-active-learning",
+            default=False,
+            type=Boolean,
+            help="whether use random retrieval for active learning",
+        )
+        parser.add_argument(
+            "--uncertainty-sampling",
+            default=False,
+            type=Boolean,
+            help="whether use uncertainty sampling for active learning",
         )
     def __init__(self, args, dictionary):
         super().__init__(args)
@@ -239,6 +251,7 @@ class UniMolFinetuneActiveTask(UnicoreTask):
             self.std = task_metainfo[self.args.task_name]["std"]
         self.tstep = 0
         self.candidate_features = None
+        self.all_features = None
         self.batch_size = args.batch_size
         self.fdata, self.len_data = self.load_local_dataset("train")
         self.fdata = next(iter(self.fdata))
@@ -562,11 +575,12 @@ class UniMolFinetuneActiveTask(UnicoreTask):
             "net_input" : net_input,
             "target" : target
         }
-        return sample 
+        return sample
     
     
     def create_adversarial_sample(self, model):
         sample = self.retrieve_data_sample(mode='aug')
+
         feature, _ = model(
             **sample["net_input"],
             features_only=True,
@@ -587,25 +601,96 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         #print(update_feature)
         scores, pred = similarity_search(self.candidate_features, update_feature, feature.size(-1), normalize=True)
 
-        
-        for idx in range(update_feature.shape[0]):
-            found = 0
-            for i in range(len(pred[idx])):
-                adv_idx = pred[idx][i]
-                if adv_idx not in self.used_id_list:
-                    found = 1
-                    break
-            if found:
+        if self.args.random_active_learning:
+            cand = torch.ones(self.len_data).long().cuda()
+            for idx in self.used_id_list:
+                cand[idx] = 0
+            prob = cand / cand.sum(dim=-1)
+            selected = prob.multinomial(num_samples=self.batch_size, replacement=False)
+            for adv_idx in selected:
                 for k,v in self.full_net.items():
                     self.seed_net[k][self.scount] = v[adv_idx]
 
                 for k,v in self.full_target.items():
                     self.seed_target[k][self.scount] = v[adv_idx]
                 self.set_sample_used(adv_idx)
-                self.scount += 1        
+                self.scount += 1  
+        else:
+            for idx in range(update_feature.shape[0]):
+                found = 0
+                for i in range(len(pred[idx])):
+                    adv_idx = pred[idx][i]
+                    if adv_idx not in self.used_id_list:
+                        found = 1
+                        break
+                if found:
+                    for k,v in self.full_net.items():
+                        self.seed_net[k][self.scount] = v[adv_idx]
+
+                    for k,v in self.full_target.items():
+                        self.seed_target[k][self.scount] = v[adv_idx]
+                    self.set_sample_used(adv_idx)
+                    self.scount += 1        
         
         return self.scount 
 
+    def create_uncertainty_sampling_sample(self, model):
+
+        cans = []
+        for idx in range(self.len_data):
+            if idx not in self.used_id_list:
+                cans.append(idx)
+        
+        bsz = 16
+        block = len(cans) // bsz 
+        entropy = np.zeros(len(cans), float)
+        for i in range(block+1):
+            if i < block:
+                l = i*bsz
+                r = (i+1)*bsz
+            else:
+                l = i*bsz
+                r = len(cans)
+            net_input = OrderedDict()
+            target = OrderedDict()
+            for k,v in self.full_net.items():
+                net_input[k] = v[cans[l:r]]
+            for k,v in self.full_target.items():
+                target[k] = v[cans[l:r]]
+
+            logits, _, _, _, _ = model(
+                **net_input,
+                classification_head_name=self.args.classification_head_name,
+            )
+            not_valid = target["finetune_target"] <= -0.5
+            pred = torch.sigmoid(logits)
+            entropy_cur = - (pred * pred.log() + (1-pred) * (1-pred).log())
+            entropy_cur[not_valid] = 0
+            entropy_cur = entropy_cur.mean(dim=-1)
+            if i < block:
+                entropy[i*bsz:(i+1)*bsz] = entropy_cur.detach().float().cpu().numpy()
+            else:
+                entropy[i*bsz:] = entropy_cur.detach().float().cpu().numpy()
+
+
+       
+        # selected = entropy.topk(k=self.batch_size, largest=True)[1]
+        selected = np.argsort(entropy)[-self.batch_size:]
+        print(selected, entropy[selected])
+        #print()
+
+
+        for idx in range(self.batch_size):
+            adv_idx = cans[selected[idx]]
+            for k,v in self.full_net.items():
+                self.seed_net[k][self.scount] = v[adv_idx]
+
+            for k,v in self.full_target.items():
+                self.seed_target[k][self.scount] = v[adv_idx]
+            self.set_sample_used(adv_idx)
+            self.scount += 1        
+        return self.scount 
+    
     def adversarial_attack(self, model, classifier, sample, feature):
         feature = feature.detach()
         feature.requires_grad = True 
@@ -655,14 +740,18 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         while self.tstep % (self.args.aug_steps + self.args.ft_steps) > self.args.ft_steps:
             if self.candidate_features is None:
                 self.candidate_features = self.encode_features(model)
+                self.all_features = self.candidate_features
                 for idx in self.used_id_list:
                     self.set_sample_used(idx)
             
             if self.scount - self.scount_init < self.label_budgt:
-                self.create_adversarial_sample(model)
+                if self.args.uncertainty_sampling:
+                    self.create_uncertainty_sampling_sample(model)
+                else:
+                    self.create_adversarial_sample(model)
                 
             self.tstep += 1 
-        
+        self.candidate_features = None
         sample = self.retrieve_data_sample(mode='ft')
         self.tstep += 1
         with torch.autograd.profiler.record_function("forward"):

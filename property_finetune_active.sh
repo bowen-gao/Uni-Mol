@@ -1,7 +1,7 @@
 data_path="/data/data/molecule/molecular_property_prediction/"  # replace to your data path
 
 n_gpu=1
-MASTER_PORT=10089
+MASTER_PORT=10086
 dict_name="dict.txt"
 weight_path="/data/models/unimol/pretrain/mol_pre_no_h_220816.pt"  # replace to your ckpt path
 task_name="toxcast"  # molecular property prediction task name 
