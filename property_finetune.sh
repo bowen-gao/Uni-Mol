@@ -4,14 +4,14 @@ n_gpu=1
 MASTER_PORT=10089
 dict_name="dict.txt"
 weight_path="/data/models/unimol/pretrain/mol_pre_no_h_220816.pt"  # replace to your ckpt path
-task_name="toxcast_seed"  # molecular property prediction task name 
+task_name="toxcast"  # molecular property prediction task name 
 save_dir="/data/models/unimol/save/${task_name}_$(date +"%Y-%m-%d_%H-%M-%S")/"  # replace to your save path
 tsb_dir="./tsbs/${task_name}_$(date +"%Y-%m-%d_%H-%M-%S")_tsb"
 task_num=617
 loss_func="finetune_smooth_mae"
 loss_func="finetune_cross_entropy"
 loss_func="multi_task_BCE"
-lr=1e-4
+lr=1e-3
 batch_size=16
 local_batch_size=16
 epoch=80
@@ -45,7 +45,7 @@ python -m torch.distributed.launch --nproc_per_node=$n_gpu --master_port=$MASTER
        --log-interval 100 --log-format simple \
        --validate-interval 1 \
        --finetune-from-model $weight_path \
-       --best-checkpoint-metric $metric --patience 20 \
+       --best-checkpoint-metric $metric --patience $epoch \
        --save-dir $save_dir --tensorboard-logdir $tsb_dir \
        --only-polar $only_polar \
        --maximize-best-checkpoint-metric

@@ -121,7 +121,7 @@ class MultiTaskBCELoss(CrossEntropyLoss):
     def __init__(self, task):
         super().__init__(task)
 
-    def forward(self, model, sample, reduce=True):
+    def forward(self, model, sample, reduce=True, fix_encoder=False):
         """Compute the loss for the given sample.
         Returns a tuple with three elements:
         1) the loss
@@ -133,6 +133,7 @@ class MultiTaskBCELoss(CrossEntropyLoss):
             masked_tokens=None,
             features_only=True,
             classification_head_name=self.args.classification_head_name,
+            fix_encoder=fix_encoder
         )
         logit_output = net_output[0]
         is_valid = sample["target"]["finetune_target"] > -0.5

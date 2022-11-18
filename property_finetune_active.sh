@@ -1,7 +1,7 @@
 data_path="/data/data/molecule/molecular_property_prediction/"  # replace to your data path
 
 n_gpu=1
-MASTER_PORT=10086
+MASTER_PORT=10099
 dict_name="dict.txt"
 weight_path="/data/models/unimol/pretrain/mol_pre_no_h_220816.pt"  # replace to your ckpt path
 task_name="toxcast"  # molecular property prediction task name 
@@ -45,7 +45,7 @@ python -m torch.distributed.launch --nproc_per_node=$n_gpu --master_port=$MASTER
        --log-interval 100 --log-format simple \
        --validate-interval 1 \
        --finetune-from-model $weight_path \
-       --best-checkpoint-metric $metric --patience 100 \
+       --best-checkpoint-metric $metric --patience $epoch \
        --save-dir $save_dir --tensorboard-logdir $tsb_dir \
        --only-polar $only_polar \
        --maximize-best-checkpoint-metric

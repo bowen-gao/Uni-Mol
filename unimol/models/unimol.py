@@ -191,6 +191,7 @@ class UniMolModel(BaseUnicoreModel):
         features_only=False,
         classification_head_name=None,
         encode_mode=False,
+        fix_encoder=False,
         **kwargs
     ):
 
@@ -244,7 +245,10 @@ class UniMolModel(BaseUnicoreModel):
                 encoder_distance = self.dist_head(encoder_pair_rep)
 
         if classification_head_name is not None:
-            logits = self.classification_heads[classification_head_name](encoder_rep)
+            if fix_encoder:
+                logits = self.classification_heads[classification_head_name](encoder_rep.detach())
+            else:
+                logits = self.classification_heads[classification_head_name](encoder_rep)
         if self.args.mode == 'infer' or encode_mode==True:
             return encoder_rep, encoder_pair_rep
         else:
@@ -327,6 +331,7 @@ class ClassificationHead(nn.Module):
     ):
         super().__init__()
         self.dense = nn.Linear(input_dim, inner_dim)
+        self.dense_2 = nn.Linear(inner_dim, inner_dim)
         self.activation_fn = utils.get_activation_fn(activation_fn)
         self.dropout = nn.Dropout(p=pooler_dropout)
         self.out_proj = nn.Linear(inner_dim, num_classes)

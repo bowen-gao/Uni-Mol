@@ -13,7 +13,8 @@ import faiss
 import lmdb
 import pickle
 import torch.nn.functional as F
-
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.decomposition import PCA
 
 from unicore.data import (
     Dictionary,
@@ -130,6 +131,7 @@ def similarity_search(x, y, dim, normalize=False):
 
 
 
+
 @register_task("mol_finetune_active")
 class UniMolFinetuneActiveTask(UnicoreTask):
     """Task for training transformer auto-encoder models."""
@@ -211,7 +213,7 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         )
         parser.add_argument(
             "--adv-lambda",
-            default=0.5,
+            default=0.3,
             type=float,
             help="step size for adv attack",
         )
@@ -232,6 +234,12 @@ class UniMolFinetuneActiveTask(UnicoreTask):
             default=False,
             type=Boolean,
             help="whether use uncertainty sampling for active learning",
+        )
+        parser.add_argument(
+            "--fix-encoder",
+            default=False,
+            type=Boolean,
+            help="whether fix encoder when finetuning the classifier",
         )
     def __init__(self, args, dictionary):
         super().__init__(args)
@@ -259,7 +267,21 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         self.full_net = self.fdata["net_input"]
         self.full_target = self.fdata["target"]
         self.full_smi = self.fdata["smi_name"]
-        
+
+        '''
+
+        self.qm9data, self.qm9_len_data = self.load_qm9_dataset("train")
+        self.qm9data = next(iter(self.qm9data))
+        self.qm9data = unicore.utils.move_to_cuda(self.qm9data)
+        self.qm9_net = self.qm9data["net_input"]
+        for k,v in self.qm9_net.items():
+            print(k, v.shape)
+        for k,v in self.full_net.items():
+            print(k, v.shape)
+        self.qm9_target = self.qm9data["target"]
+        print(self.qm9_target["finetune_target"].shape)
+        self.qm9_smi = self.qm9data["smi_name"]
+        '''
         self.seed_net, self.seed_target, self.seed_smi, selected = self.load_seed_data()
         self.seed_smi = list(self.seed_smi)
         self.scount = len(selected)
@@ -275,6 +297,9 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         self.mode = "ft"
         self.cur_aug_steps = 0
         self.cur_ft_steps = 0
+        self.used_aug_list = []
+        self.pca = None
+        self.pca_candidate_features = None
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -380,6 +405,7 @@ class UniMolFinetuneActiveTask(UnicoreTask):
             split (str): name of the data scoure (e.g., train)
         """
         split_path = os.path.join(self.args.data, self.args.task_name, split + ".lmdb")
+        # split_path = "/data/data/molecule/molecular_property_prediction/qm9/train.lmdb"
         dataset = LMDBDataset(split_path)
         if split == "train":
             tgt_dataset = KeyDataset(dataset, "target")
@@ -454,15 +480,96 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         len_data = len(nest_dataset)
         return torch.utils.data.DataLoader(nest_dataset, batch_size=len_data, collate_fn=nest_dataset.collater), len_data
     
+    def load_qm9_dataset(self, split, **kwargs):
+        """Load a given dataset split.
+        Args:
+            split (str): name of the data scoure (e.g., train)
+        """
+        split_path = os.path.join(self.args.data, self.args.task_name, split + ".lmdb")
+        split_path = "/home/gaobowen/666.lmdb"
+        dataset = LMDBDataset(split_path)
+        if split == "train":
+            tgt_dataset = KeyDataset(dataset, "target")
+            smi_dataset = KeyDataset(dataset, "smi")
+            sample_dataset = ConformerSampleDataset(
+                dataset, self.args.seed, "atoms", "coordinates"
+            )
+            dataset = AtomTypeDataset(dataset, sample_dataset)
+        else:
+            dataset = TTADataset(
+                dataset, self.args.seed, "atoms", "coordinates", self.args.conf_size
+            )
+            dataset = AtomTypeDataset(dataset, dataset)
+            tgt_dataset = KeyDataset(dataset, "target")
+            smi_dataset = KeyDataset(dataset, "smi")
+
+        dataset = RemoveHydrogenDataset(
+            dataset,
+            "atoms",
+            "coordinates",
+            self.args.remove_hydrogen,
+            self.args.remove_polar_hydrogen,
+        )
+        dataset = CroppingDataset(
+            dataset, self.seed, "atoms", "coordinates", self.args.max_atoms
+        )
+        dataset = NormalizeDataset(dataset, "coordinates", normalize_coord=True)
+        src_dataset = KeyDataset(dataset, "atoms")
+        src_dataset = TokenizeDataset(
+            src_dataset, self.dictionary, max_seq_len=self.args.max_seq_len
+        )
+        coord_dataset = KeyDataset(dataset, "coordinates")
+        def PrependAndAppend(dataset, pre_token, app_token):
+            dataset = PrependTokenDataset(dataset, pre_token)
+            return AppendTokenDataset(dataset, app_token)
+        src_dataset = PrependAndAppend(
+            src_dataset, self.dictionary.bos(), self.dictionary.eos()
+        )
+        edge_type = EdgeTypeDataset(src_dataset, len(self.dictionary))
+        coord_dataset = FromNumpyDataset(coord_dataset)
+        coord_dataset = PrependAndAppend(coord_dataset, 0.0, 0.0)
+        distance_dataset = DistanceDataset(coord_dataset)
+
+        nest_dataset = NestedDictionaryDataset(
+            {
+                "net_input": {
+                    "src_tokens": RightPadDataset(
+                        src_dataset,
+                        pad_idx=self.dictionary.pad(),
+                    ),
+                    "src_coord": RightPadDatasetCoord(
+                        coord_dataset,
+                        pad_idx=0,
+                    ),
+                    "src_distance": RightPadDataset2D(
+                        distance_dataset,
+                        pad_idx=0,
+                    ),
+                    "src_edge_type": RightPadDataset2D(
+                        edge_type,
+                        pad_idx=0,
+                    ),
+                },
+                "target": {
+                    "finetune_target": RawLabelDataset(tgt_dataset),
+                },
+                "smi_name": RawArrayDataset(smi_dataset),
+            },
+        )
+        len_data = len(nest_dataset)
+        return torch.utils.data.DataLoader(nest_dataset, batch_size=len_data, collate_fn=nest_dataset.collater), len_data
+
     def encode_features(self, model):
         import time
         start_time = time.time()
         
-        
+
         bsz = 16
         block = self.len_data // bsz 
         candidate_features = np.zeros((self.len_data, 512), float)
         for i in range(block+1):
+            if i*bsz == self.len_data:
+                break
             if i < block:
                 l = i*bsz
                 r = (i+1)*bsz
@@ -480,11 +587,18 @@ class UniMolFinetuneActiveTask(UnicoreTask):
                 encode_mode=True
             )
 
-            feature = encode_rep.mean(dim=1)
+            feature = encode_rep[:,0,:]
             candidate_features[l:r] = feature.detach().float().cpu().numpy()
 
         # print("candidate_features", candidate_features.shape)
         print("--- %s seconds ---" % (time.time() - start_time))
+
+        self.pca = PCA(n_components=8)
+        
+        self.pca.fit(candidate_features)
+        self.pca_candidate_features = self.pca.transform(candidate_features)
+
+
         return candidate_features
     
     def build_model(self, args):
@@ -498,7 +612,7 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         return model
     
     
-    def set_sample_used(self, used_id, defult_used_value = 0):
+    def set_sample_used(self, used_id, defult_used_value = 1000):
         self.candidate_features[used_id] = defult_used_value
         
         used_id = int(used_id)
@@ -533,8 +647,9 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         return seed_net, seed_target, seed_smi, selected
 
     
-    def retrieve_data_sample(self, mode='ft'):
-        bsz = self.batch_size
+    def retrieve_data_sample(self, mode='ft', bsz=None):
+        if bsz is None:
+            bsz = self.batch_size
         
         if mode == 'ft':
             cand = self.sdata_ft_sampled[:self.scount]
@@ -577,62 +692,153 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         }
         return sample
     
+    def retrieve_data_sample_aug(self, num_sample):
+        
+    
+        cand = self.sdata_aug_sampled[:self.scount]
+
+        if cand.sum(dim=-1) < num_sample:
+            self.sdata_aug_sampled = torch.ones_like(self.sdata_aug_sampled)
+            cand = self.sdata_aug_sampled[:self.scount]
+        
+        
+
+        prob = cand / cand.sum(dim=-1)
+        selected = prob.multinomial(num_samples=num_sample, replacement=False)
+        
+        # print(selected)
+
+
+
+        self.sdata_aug_sampled[selected] = 0
+
+        net_input = OrderedDict()
+
+        target = OrderedDict()
+
+        for k,v in self.seed_net.items():
+            net_input[k] = v.index_select(dim=0, index=selected)
+        for k,v in self.seed_target.items():
+            target[k] = v.index_select(dim=0, index=selected)
+
+        sample = {
+            "net_input" : net_input,
+            "target" : target
+        }
+        return sample
     
     def create_adversarial_sample(self, model):
-        sample = self.retrieve_data_sample(mode='aug')
-
+        sample = self.retrieve_data_sample(mode="aug", bsz = 3*self.batch_size)
         feature, _ = model(
             **sample["net_input"],
             features_only=True,
             classification_head_name=self.args.classification_head_name,
             encode_mode=True
         )
-        #feature = torch.squeeze(encode_rep[:, 0, :], 1)
-        # print("encode_out", feature.shape)
+
         classifier = model.classification_heads[self.args.classification_head_name]
-        if self.args.random_gaussian:
-            noise = torch.normal(mean=0, std=1, size=feature.size()).type_as(feature)
-            update_feature = feature + 0.1 * noise
-            update_feature = feature.mean(dim=1)
-        else:
-            update_feature = self.adversarial_attack(model, classifier, sample, feature)
-        
+        update_feature = self.adversarial_attack(model, classifier, sample, feature)
         update_feature = update_feature.detach().float().cpu().numpy()
-        #print(update_feature)
-        scores, pred = similarity_search(self.candidate_features, update_feature, feature.size(-1), normalize=True)
-
-        if self.args.random_active_learning:
-            cand = torch.ones(self.len_data).long().cuda()
-            for idx in self.used_id_list:
-                cand[idx] = 0
-            prob = cand / cand.sum(dim=-1)
-            selected = prob.multinomial(num_samples=self.batch_size, replacement=False)
-            for adv_idx in selected:
-                for k,v in self.full_net.items():
-                    self.seed_net[k][self.scount] = v[adv_idx]
-
-                for k,v in self.full_target.items():
-                    self.seed_target[k][self.scount] = v[adv_idx]
-                self.set_sample_used(adv_idx)
-                self.scount += 1  
-        else:
-            for idx in range(update_feature.shape[0]):
-                found = 0
-                for i in range(len(pred[idx])):
-                    adv_idx = pred[idx][i]
-                    if adv_idx not in self.used_id_list:
-                        found = 1
-                        break
-                if found:
-                    for k,v in self.full_net.items():
-                        self.seed_net[k][self.scount] = v[adv_idx]
-
-                    for k,v in self.full_target.items():
-                        self.seed_target[k][self.scount] = v[adv_idx]
-                    self.set_sample_used(adv_idx)
-                    self.scount += 1        
+        #scores, pred = similarity_search(self.candidate_features, update_feature, feature.size(-1), normalize=False)  
+        pca_update_feature = self.pca.transform(update_feature)
+        print(pca_update_feature.shape)
+        scores, pred = similarity_search(self.pca_candidate_features, pca_update_feature, pca_update_feature.shape[-1], normalize=False)  
+        '''
+        cur_feature = feature[:,0,:].detach().float().cpu().numpy()
+        original_dist = np.linalg.norm(self.candidate_features[pred[0][0]].reshape(1, -1) - cur_feature[0].reshape(1, -1))
+        update_dist = np.linalg.norm(self.candidate_features[pred[0][0]].reshape(1, -1) - update_feature[0].reshape(1, -1))
         
+        print("original_dist", original_dist)
+        print("update_dist", update_dist)
+        '''
+        adv_cans = []
+        for idx in range(update_feature.shape[0]):
+            count = 0
+            for i in range(len(pred[idx])):
+                if count==1:
+                    break
+                adv_idx = pred[idx][i]
+                score = scores[idx][i]
+                if adv_idx not in self.used_id_list:
+                    if adv_idx not in adv_cans:
+                        adv_cans.append(adv_idx) 
+                        count+=1
+      
+        # adv_cans = []
+        adv_cans = np.array(adv_cans)
+        
+        randoms = []
+        for idx in range(self.len_data):
+            if idx not in self.used_id_list:
+                if idx not in adv_cans:
+                    randoms.append(idx)
+        randoms = np.array(randoms)
+        num_random = 4 * self.batch_size - len(adv_cans)
+        # num_random = 4 * self.batch_size
+        random_cans = np.random.choice(randoms, num_random, replace=False)
+        cans = np.concatenate([adv_cans, random_cans])
+        # cans = adv_cans
+        print(len(adv_cans), len(random_cans))
+        bsz = 16
+        block = len(cans) // bsz 
+        entropy = np.zeros(len(cans), float)
+        for i in range(block+1):
+            if i*bsz == len(cans):
+                break
+            if i < block:
+                l = i*bsz
+                r = (i+1)*bsz
+            else:
+                l = i*bsz
+                r = len(cans)
+            net_input = OrderedDict()
+            target = OrderedDict()
+            for k,v in self.full_net.items():
+                net_input[k] = v[cans[l:r]]
+            for k,v in self.full_target.items():
+                target[k] = v[cans[l:r]]
+
+            logits, _, _, _, _ = model(
+                **net_input,
+                classification_head_name=self.args.classification_head_name,
+            )
+            not_valid = target["finetune_target"] <= -0.5
+            pred = torch.sigmoid(logits)
+            entropy_cur = - (pred * pred.log() + (1-pred) * (1-pred).log())
+            entropy_cur[not_valid] = 0
+            entropy_cur = entropy_cur.mean(dim=-1)
+            if i < block:
+                entropy[i*bsz:(i+1)*bsz] = entropy_cur.detach().float().cpu().numpy()
+            else:
+                entropy[i*bsz:] = entropy_cur.detach().float().cpu().numpy()
+
+
+       
+        # selected = entropy.topk(k=self.batch_size, largest=True)[1]
+        selected = np.argsort(entropy)[-self.batch_size:]
+        print(selected, entropy[selected])
+        #print()
+        adv_count = 0
+        random_count = 0
+        for idx in range(self.batch_size):
+            adv_idx = cans[selected[idx]]
+            if adv_idx in adv_cans:
+                adv_count+=1
+            else:
+                random_count+=1
+        print("ratio", adv_count, random_count)
+        for idx in range(self.batch_size):
+            adv_idx = cans[selected[idx]]
+            for k,v in self.full_net.items():
+                self.seed_net[k][self.scount] = v[adv_idx]
+
+            for k,v in self.full_target.items():
+                self.seed_target[k][self.scount] = v[adv_idx]
+            self.set_sample_used(adv_idx)
+            self.scount += 1        
         return self.scount 
+            
+
 
     def create_uncertainty_sampling_sample(self, model):
 
@@ -645,6 +851,8 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         block = len(cans) // bsz 
         entropy = np.zeros(len(cans), float)
         for i in range(block+1):
+            if i*bsz == len(cans):
+                break
             if i < block:
                 l = i*bsz
                 r = (i+1)*bsz
@@ -698,7 +906,12 @@ class UniMolFinetuneActiveTask(UnicoreTask):
         model.train()
         logit_output = classifier(feature)
         is_valid = sample["target"]["finetune_target"] > -0.5
+        not_valid = sample["target"]["finetune_target"] <= -0.5
         pred = logit_output[is_valid].float()
+        pred_sigmoid = torch.sigmoid(logit_output)
+        entropy = - (pred_sigmoid * pred_sigmoid.log() + (1-pred_sigmoid) * (1-pred_sigmoid).log())
+        entropy[not_valid] = 0
+        entropy = entropy.mean(dim=-1, keepdim=True)
         targets = sample["target"]["finetune_target"][is_valid].float()
         loss = F.binary_cross_entropy_with_logits(
             pred,
@@ -708,9 +921,13 @@ class UniMolFinetuneActiveTask(UnicoreTask):
 
         model.zero_grad()
         loss.backward()
-        avg_fnorm = feature.norm(dim=-1).mean() / feature.grad.norm(dim=-1).mean()
-        update_feature = feature + self.args.adv_lambda * avg_fnorm  * feature.grad 
-        update_feature = update_feature.mean(dim=1)
+        feature_grad = feature.grad[:,0,:]
+        feature = feature[:,0,:]
+        avg_fnorm = feature.norm(dim=-1) / feature_grad.norm(dim=-1)
+        avg_fnorm = avg_fnorm.view(-1, 1).expand(-1, feature_grad.shape[1])
+        #print(entropy.shape, avg_fnorm.shape, feature.grad.shape)
+        update_feature = feature + self.args.adv_lambda * avg_fnorm  * feature_grad
+        # update_feature = update_feature.mean(dim=1)
         return update_feature 
     
     def train_step(
@@ -752,10 +969,12 @@ class UniMolFinetuneActiveTask(UnicoreTask):
                 
             self.tstep += 1 
         self.candidate_features = None
+        self.sdata_aug_sampled = torch.ones_like(self.sdata_aug_sampled)
+        self.used_aug_list = []
         sample = self.retrieve_data_sample(mode='ft')
         self.tstep += 1
         with torch.autograd.profiler.record_function("forward"):
-            loss, sample_size, logging_output = loss(model, sample)
+            loss, sample_size, logging_output = loss(model, sample, fix_encoder=self.args.fix_encoder)
         if ignore_grad:
             loss *= 0
         with torch.autograd.profiler.record_function("backward"):

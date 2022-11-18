@@ -5,6 +5,7 @@
 import logging
 import os
 import torch
+from xmlrpc.client import Boolean
 
 import numpy as np
 from unicore.data import (
@@ -164,6 +165,12 @@ class UniMolFinetuneTask(UnicoreTask):
             type=int,
             help="1: only reserve polar hydrogen; 0: no hydrogen; -1: all hydrogen ",
         )
+        parser.add_argument(
+            "--fix-encoder",
+            default=True,
+            type=Boolean,
+            help="whether fix encoder when finetuning the classifier",
+        )
 
     def __init__(self, args, dictionary):
         super().__init__(args)
@@ -311,7 +318,7 @@ class UniMolFinetuneTask(UnicoreTask):
         model.train()
         model.set_num_updates(update_num)
         with torch.autograd.profiler.record_function("forward"):
-            loss, sample_size, logging_output = loss(model, sample)
+            loss, sample_size, logging_output = loss(model, sample, fix_encoder=self.args.fix_encoder)
         if ignore_grad:
             loss *= 0
         with torch.autograd.profiler.record_function("backward"):
